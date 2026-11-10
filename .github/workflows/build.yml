@@ -292,6 +292,7 @@ jobs:
         if: inputs.ksun == 'true'
         shell: bash
         run: |
+          set +eo pipefail
           cd "$COMMON"
           echo "=== Exporting symbols for kernelsu.ko (CONFIG_KSU=m) ==="
 
