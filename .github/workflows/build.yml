@@ -318,32 +318,33 @@ jobs:
           compression-level: 9
 
       - name: Find and upload KernelSU module
+        if: always()
         shell: bash
         run: |
           echo "=== Searching for kernelsu .ko files ==="
-          find "$CONFIG" -name "*.ko" 2>/dev/null | grep -i "ksu\|kernelsu" | tee /tmp/ko_files.txt || true
-          echo "=== Searching all .ko files ==="
-          find "$CONFIG" -name "*.ko" 2>/dev/null | head -50 || true
-
           KO_DIR="${GITHUB_WORKSPACE}/ko_output"
           mkdir -p "$KO_DIR"
 
+          # Search the entire workspace for .ko files (covers Bazel output dirs too)
+          echo "--- All .ko files in workspace ---"
+          find "${GITHUB_WORKSPACE}" -name "*.ko" -type f 2>/dev/null | head -100 || true
+
+          echo "--- KSU-related .ko files ---"
+          find "${GITHUB_WORKSPACE}" -name "*.ko" -type f 2>/dev/null | grep -i "ksu\|kernelsu" | tee /tmp/ko_files.txt || true
+
+          # Copy KSU modules
           while IFS= read -r ko; do
-            if [ -n "$ko" ] && [ -f "$ko" ]; then
-              cp "$ko" "$KO_DIR/"
-              echo "Found KSU module: $ko"
-            fi
+            [ -n "$ko" ] && [ -f "$ko" ] && cp -v "$ko" "$KO_DIR/"
           done < /tmp/ko_files.txt
 
-          # Also grab any .ko from common KernelSU build paths
-          for ko in $(find "$CONFIG" -path "*/KernelSU*/*.ko" -o -path "*/kernelsu*.ko" 2>/dev/null); do
-            if [ -f "$ko" ]; then
-              cp "$ko" "$KO_DIR/"
-              echo "Found: $ko"
-            fi
+          # Also search standard Bazel output paths
+          for search_root in "$CONFIG" "${GITHUB_WORKSPACE}/bazel-bin" "${GITHUB_WORKSPACE}/bazel-out"; do
+            [ -d "$search_root" ] || continue
+            find "$search_root" -path "*/kernelsu*" -name "*.ko" -type f 2>/dev/null | while read -r ko; do
+              cp -v "$ko" "$KO_DIR/" 2>/dev/null || true
+            done
           done
 
-          # List what we found
           echo "=== Module output ==="
           ls -la "$KO_DIR/" 2>/dev/null || echo "No .ko files found"
 
