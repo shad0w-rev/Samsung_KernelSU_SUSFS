@@ -287,7 +287,99 @@ jobs:
 
       - name: configure LTO
         uses: ./.github/actions/lto
-        
+
+      - name: Export symbols for KSU module build
+        if: inputs.ksun == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$COMMON"
+          echo "=== Exporting symbols for kernelsu.ko (CONFIG_KSU=m) ==="
+
+          export_sym() {
+            local file="$1" sym="$2"
+            if [ -f "$file" ]; then
+              grep -q "EXPORT_SYMBOL.*\b${sym}\b" "$file" 2>/dev/null || {
+                echo "EXPORT_SYMBOL_GPL(${sym});" >> "$file"
+                echo "  exported ${sym} from ${file}"
+              }
+            else
+              echo "  WARN: ${file} not found, skipping ${sym}"
+            fi
+          }
+
+          # --- Symbols from first build (original modpost errors) ---
+          export_sym fs/namespace.c                path_umount
+          export_sym fs/namespace.c                path_mount
+          export_sym fs/namespace.c                mntns_operations
+          export_sym mm/maccess.c                  strncpy_from_user_nofault
+          export_sym mm/maccess.c                  copy_to_kernel_nofault
+          export_sym mm/init-mm.c                  init_mm
+          export_sym kernel/kallsyms.c             kallsyms_lookup_size_offset
+          export_sym fs/open.c                     __arm64_sys_close
+          export_sym arch/arm64/mm/mmu.c           __set_fixmap
+
+          # dcache_clean_inval_poc (assembly — export from a C file in same dir)
+          DCACHE_DONE=false
+          for cfile in arch/arm64/mm/flush.c arch/arm64/mm/mmu.c; do
+            if [ -f "$cfile" ] && [ "$DCACHE_DONE" = false ]; then
+              grep -q 'EXPORT_SYMBOL.*dcache_clean_inval_poc' "$cfile" 2>/dev/null || {
+                printf '\nextern void dcache_clean_inval_poc(unsigned long start, unsigned long end);\nEXPORT_SYMBOL_GPL(dcache_clean_inval_poc);\n' >> "$cfile"
+                echo "  exported dcache_clean_inval_poc from ${cfile}"
+              }
+              DCACHE_DONE=true
+            fi
+          done
+
+          # anon_inode_getfile_secure — only if function exists
+          if [ -f fs/anon_inodes.c ] && grep -q 'anon_inode_getfile_secure' fs/anon_inodes.c; then
+            export_sym fs/anon_inodes.c anon_inode_getfile_secure
+          fi
+
+          # tracepoint sys_enter
+          for tf in kernel/trace/syscall.c kernel/tracepoint.c; do
+            if [ -f "$tf" ] && grep -q 'sys_enter' "$tf"; then
+              grep -q 'EXPORT_TRACEPOINT_SYMBOL.*sys_enter' "$tf" 2>/dev/null || {
+                echo 'EXPORT_TRACEPOINT_SYMBOL_GPL(sys_enter);' >> "$tf"
+                echo "  exported tracepoint sys_enter from ${tf}"
+              }
+              break
+            fi
+          done
+
+          # --- Symbols from second build (remaining modpost warnings) ---
+          export_sym fs/fs_struct.c                set_fs_pwd
+          export_sym kernel/fork.c                 __arm64_sys_unshare
+          export_sym kernel/nsproxy.c              __arm64_sys_setns
+
+          # ns_get_path — could be in fs/nsfs.c or kernel/nsproxy.c
+          for nf in fs/nsfs.c kernel/nsproxy.c fs/namespace.c; do
+            if [ -f "$nf" ] && grep -q 'ns_get_path' "$nf"; then
+              export_sym "$nf" ns_get_path
+              break
+            fi
+          done
+
+          # current_chrooted — search for definition
+          for cf in fs/open.c fs/proc_namespace.c kernel/exit.c; do
+            if [ -f "$cf" ] && grep -q 'current_chrooted' "$cf"; then
+              export_sym "$cf" current_chrooted
+              break
+            fi
+          done
+
+          # SUSFS symbols — find where the SUSFS patches put them
+          for sym in susfs_init susfs_extra_works susfs_is_avc_log_spoofing_enabled; do
+            src=$(grep -rn "^.*\b${sym}\b.*(" --include='*.c' fs/ kernel/ drivers/ 2>/dev/null | grep -v 'extern\|EXPORT_SYMBOL' | head -1 | cut -d: -f1)
+            if [ -n "$src" ] && [ -f "$src" ]; then
+              export_sym "$src" "$sym"
+            else
+              echo "  WARN: could not find definition of ${sym}"
+            fi
+          done
+
+          echo "=== Symbol exports complete ==="
+
       - name: Build
         uses: ./.github/actions/build
         with:
@@ -321,32 +413,38 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "=== Searching for kernelsu .ko files ==="
+          echo "=== Searching for kernelsu.ko ==="
           KO_DIR="${GITHUB_WORKSPACE}/ko_output"
           mkdir -p "$KO_DIR"
 
-          # Search the entire workspace for .ko files (covers Bazel output dirs too)
-          echo "--- All .ko files in workspace ---"
-          find "${GITHUB_WORKSPACE}" -name "*.ko" -type f 2>/dev/null | head -100 || true
+          # Search specifically for kernelsu.ko (not all .ko files)
+          echo "--- Searching workspace for kernelsu.ko ---"
+          find "${GITHUB_WORKSPACE}" -name "kernelsu.ko" -type f 2>/dev/null | tee /tmp/ko_files.txt || true
 
-          echo "--- KSU-related .ko files ---"
-          find "${GITHUB_WORKSPACE}" -name "*.ko" -type f 2>/dev/null | grep -i "ksu\|kernelsu" | tee /tmp/ko_files.txt || true
+          # Also search Bazel sandbox/output paths (may be outside workspace)
+          echo "--- Searching Bazel output paths ---"
+          for base in "$CONFIG/out" "$CONFIG/bazel-bin" "$CONFIG/bazel-out" /tmp/bazel-*; do
+            [ -d "$base" ] 2>/dev/null || continue
+            find "$base" -name "kernelsu.ko" -type f 2>/dev/null | tee -a /tmp/ko_files.txt || true
+          done
 
-          # Copy KSU modules
-          while IFS= read -r ko; do
+          # Follow symlinks in Bazel output
+          if [ -d "$CONFIG" ]; then
+            find "$CONFIG" -name "kernelsu.ko" -follow -type f 2>/dev/null | tee -a /tmp/ko_files.txt || true
+          fi
+
+          # Deduplicate and copy
+          sort -u /tmp/ko_files.txt | while IFS= read -r ko; do
             [ -n "$ko" ] && [ -f "$ko" ] && cp -v "$ko" "$KO_DIR/"
-          done < /tmp/ko_files.txt
-
-          # Also search standard Bazel output paths
-          for search_root in "$CONFIG" "${GITHUB_WORKSPACE}/bazel-bin" "${GITHUB_WORKSPACE}/bazel-out"; do
-            [ -d "$search_root" ] || continue
-            find "$search_root" -path "*/kernelsu*" -name "*.ko" -type f 2>/dev/null | while read -r ko; do
-              cp -v "$ko" "$KO_DIR/" 2>/dev/null || true
-            done
           done
 
           echo "=== Module output ==="
-          ls -la "$KO_DIR/" 2>/dev/null || echo "No .ko files found"
+          ls -la "$KO_DIR/" 2>/dev/null || echo "No kernelsu.ko found"
+
+          if [ ! -f "$KO_DIR/kernelsu.ko" ]; then
+            echo "=== DEBUG: All .ko files (excluding prebuilts) ==="
+            find "${GITHUB_WORKSPACE}" -name "*.ko" -type f -not -path "*/prebuilts/*" 2>/dev/null | head -50 || true
+          fi
 
       - name: Upload KernelSU Module
         if: always()
