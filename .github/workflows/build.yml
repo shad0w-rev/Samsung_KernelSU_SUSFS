@@ -311,6 +311,7 @@ jobs:
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("simpleroot");
           MODULE_DESCRIPTION("Simple root credential escalation module");
+          MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 
           static struct proc_dir_entry *proc_entry;
 
@@ -412,10 +413,28 @@ jobs:
             done
           fi
 
+          # Declare simpleroot.ko as a Bazel module output
+          MGK_MODULES="$CONFIG/kernel/kernel_device_modules-6.6/kernel/kleaf/mgk_modules.bzl"
+          if [ -f "$MGK_MODULES" ]; then
+            if ! grep -q "simpleroot" "$MGK_MODULES"; then
+              sed -i '/^mgk_module_ext_outs = \[$/a\    "drivers/simpleroot/simpleroot.ko",' "$MGK_MODULES"
+              echo "Added simpleroot.ko to mgk_module_ext_outs in mgk_modules.bzl"
+            fi
+          else
+            echo "WARN: mgk_modules.bzl not found at $MGK_MODULES"
+            # Fallback: try to find and patch modules.bzl in kernel-6.6
+            GKI_MODULES="$COMMON/modules.bzl"
+            if [ -f "$GKI_MODULES" ] && ! grep -q "simpleroot" "$GKI_MODULES"; then
+              sed -i '/_COMMON_GKI_MODULES_LIST = \[$/a\    "drivers/simpleroot/simpleroot.ko",' "$GKI_MODULES"
+              echo "Added simpleroot.ko to _COMMON_GKI_MODULES_LIST in modules.bzl"
+            fi
+          fi
+
           echo "=== Injection complete ==="
           cat "$SR_DIR/simpleroot.c" | head -5
           echo "Kconfig refs: $(grep -c simpleroot "$COMMON/drivers/Kconfig" 2>/dev/null || echo 0)"
           echo "Makefile refs: $(grep -c simpleroot "$COMMON/drivers/Makefile" 2>/dev/null || echo 0)"
+          echo "Module outs: $(grep -c simpleroot "$MGK_MODULES" 2>/dev/null || echo 0)"
 
       - name: Build
         uses: ./.github/actions/build
@@ -475,8 +494,8 @@ jobs:
             file "$KO_DIR/simpleroot.ko" 2>/dev/null || true
           else
             echo "FAIL: simpleroot.ko not found in any build output"
-            echo "--- All .ko files found ---"
-            find "$CONFIG" -name "*.ko" -type f 2>/dev/null | head -30 || true
+            echo "--- All .ko files (excluding prebuilts) ---"
+            find "$CONFIG" -name "*.ko" -type f 2>/dev/null | grep -v "/prebuilts/" | head -30 || echo "No compiled .ko files found"
             echo "--- Checking .config for SIMPLEROOT ---"
             find "$CONFIG" -name ".config" -type f 2>/dev/null | while read cfg; do
               echo "Config: $cfg"
@@ -484,6 +503,13 @@ jobs:
             done
             echo "--- Checking if source was injected ---"
             ls -la "$COMMON/drivers/simpleroot/" 2>/dev/null || echo "Source dir not found"
+            echo "--- Checking mgk_modules.bzl for simpleroot ---"
+            grep "simpleroot" "$CONFIG/kernel/kernel_device_modules-6.6/kernel/kleaf/mgk_modules.bzl" 2>/dev/null || echo "Not in mgk_modules.bzl"
+            echo "--- Checking modpost errors ---"
+            find "$CONFIG" -name "*.log" -path "*/modpost*" -type f 2>/dev/null | while read log; do
+              echo "Log: $log"
+              grep -i "simpleroot\|error\|namespace" "$log" 2>/dev/null | head -10 || true
+            done
           fi
 
       - name: Upload Root Module
