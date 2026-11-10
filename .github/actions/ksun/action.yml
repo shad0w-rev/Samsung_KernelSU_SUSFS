@@ -26,7 +26,7 @@ runs:
     - name: enable in defconfig
       shell: bash
       run: |
-         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --module CONFIG_KSU
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --enable CONFIG_KSU
          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --enable CONFIG_MODULES
 
          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_KDP
@@ -60,11 +60,6 @@ runs:
       shell: bash
       run: |
         echo "KBUILD_MODPOST_WARN=1" >> $GITHUB_ENV
-        # Patch Makefile.modpost so Bazel builds that ignore env vars still get -w
-        if [ -f "$COMMON/scripts/Makefile.modpost" ]; then
-          sed -i 's/$(if $(KBUILD_MODPOST_WARN),-w)/-w/' "$COMMON/scripts/Makefile.modpost"
-          echo "Patched Makefile.modpost to always pass -w to modpost"
-        fi
 
 #    - name: 'Fix KernelSU-Next'
 #      if: inputs.susfs == 'true'

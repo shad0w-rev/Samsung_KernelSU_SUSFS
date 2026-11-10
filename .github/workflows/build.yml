@@ -288,98 +288,6 @@ jobs:
       - name: configure LTO
         uses: ./.github/actions/lto
 
-      - name: Export symbols for KSU module build
-        if: inputs.ksun == 'true'
-        shell: bash
-        run: |
-          set +eo pipefail
-          cd "$COMMON"
-          echo "=== Exporting symbols for kernelsu.ko (CONFIG_KSU=m) ==="
-
-          export_sym() {
-            local file="$1" sym="$2"
-            if [ -f "$file" ]; then
-              grep -q "EXPORT_SYMBOL.*\b${sym}\b" "$file" 2>/dev/null || {
-                echo "EXPORT_SYMBOL_GPL(${sym});" >> "$file"
-                echo "  exported ${sym} from ${file}"
-              }
-            else
-              echo "  WARN: ${file} not found, skipping ${sym}"
-            fi
-          }
-
-          # --- Symbols from first build (original modpost errors) ---
-          export_sym fs/namespace.c                path_umount
-          export_sym fs/namespace.c                path_mount
-          export_sym fs/namespace.c                mntns_operations
-          export_sym mm/maccess.c                  strncpy_from_user_nofault
-          export_sym mm/maccess.c                  copy_to_kernel_nofault
-          export_sym mm/init-mm.c                  init_mm
-          export_sym kernel/kallsyms.c             kallsyms_lookup_size_offset
-          export_sym fs/open.c                     __arm64_sys_close
-          export_sym arch/arm64/mm/mmu.c           __set_fixmap
-
-          # dcache_clean_inval_poc (assembly — export from a C file in same dir)
-          DCACHE_DONE=false
-          for cfile in arch/arm64/mm/flush.c arch/arm64/mm/mmu.c; do
-            if [ -f "$cfile" ] && [ "$DCACHE_DONE" = false ]; then
-              grep -q 'EXPORT_SYMBOL.*dcache_clean_inval_poc' "$cfile" 2>/dev/null || {
-                printf '\nextern void dcache_clean_inval_poc(unsigned long start, unsigned long end);\nEXPORT_SYMBOL_GPL(dcache_clean_inval_poc);\n' >> "$cfile"
-                echo "  exported dcache_clean_inval_poc from ${cfile}"
-              }
-              DCACHE_DONE=true
-            fi
-          done
-
-          # anon_inode_getfile_secure — only if function exists
-          if [ -f fs/anon_inodes.c ] && grep -q 'anon_inode_getfile_secure' fs/anon_inodes.c; then
-            export_sym fs/anon_inodes.c anon_inode_getfile_secure
-          fi
-
-          # tracepoint sys_enter
-          for tf in kernel/trace/syscall.c kernel/tracepoint.c; do
-            if [ -f "$tf" ] && grep -q 'sys_enter' "$tf"; then
-              grep -q 'EXPORT_TRACEPOINT_SYMBOL.*sys_enter' "$tf" 2>/dev/null || {
-                echo 'EXPORT_TRACEPOINT_SYMBOL_GPL(sys_enter);' >> "$tf"
-                echo "  exported tracepoint sys_enter from ${tf}"
-              }
-              break
-            fi
-          done
-
-          # --- Symbols from second build (remaining modpost warnings) ---
-          export_sym fs/fs_struct.c                set_fs_pwd
-          export_sym kernel/fork.c                 __arm64_sys_unshare
-          export_sym kernel/nsproxy.c              __arm64_sys_setns
-
-          # ns_get_path — could be in fs/nsfs.c or kernel/nsproxy.c
-          for nf in fs/nsfs.c kernel/nsproxy.c fs/namespace.c; do
-            if [ -f "$nf" ] && grep -q 'ns_get_path' "$nf"; then
-              export_sym "$nf" ns_get_path
-              break
-            fi
-          done
-
-          # current_chrooted — search for definition
-          for cf in fs/open.c fs/proc_namespace.c kernel/exit.c; do
-            if [ -f "$cf" ] && grep -q 'current_chrooted' "$cf"; then
-              export_sym "$cf" current_chrooted
-              break
-            fi
-          done
-
-          # SUSFS symbols — find where the SUSFS patches put them
-          for sym in susfs_init susfs_extra_works susfs_is_avc_log_spoofing_enabled; do
-            src=$(grep -rn "^.*\b${sym}\b.*(" --include='*.c' fs/ kernel/ drivers/ 2>/dev/null | grep -v 'extern\|EXPORT_SYMBOL' | head -1 | cut -d: -f1)
-            if [ -n "$src" ] && [ -f "$src" ]; then
-              export_sym "$src" "$sym"
-            else
-              echo "  WARN: could not find definition of ${sym}"
-            fi
-          done
-
-          echo "=== Symbol exports complete ==="
-
       - name: Build
         uses: ./.github/actions/build
         with:
@@ -409,48 +317,205 @@ jobs:
             ./AnyKernel3/**
           compression-level: 9
 
-      - name: Find and upload KernelSU module
+      - name: Build simple root module
         if: always()
         shell: bash
         run: |
-          echo "=== Searching for kernelsu.ko ==="
+          set +eo pipefail
+          echo "=== Building simple root module against Samsung kernel ==="
           KO_DIR="${GITHUB_WORKSPACE}/ko_output"
           mkdir -p "$KO_DIR"
+          MOD_DIR="${GITHUB_WORKSPACE}/simpleroot"
+          mkdir -p "$MOD_DIR"
 
-          # Search specifically for kernelsu.ko (not all .ko files)
-          echo "--- Searching workspace for kernelsu.ko ---"
-          find "${GITHUB_WORKSPACE}" -name "kernelsu.ko" -type f 2>/dev/null | tee /tmp/ko_files.txt || true
+          # Find the kernel build output (Bazel puts it in a sandbox)
+          echo "--- Locating kernel build output ---"
+          KBUILD=""
 
-          # Also search Bazel sandbox/output paths (may be outside workspace)
-          echo "--- Searching Bazel output paths ---"
-          for base in "$CONFIG/out" "$CONFIG/bazel-bin" "$CONFIG/bazel-out" /tmp/bazel-*; do
-            [ -d "$base" ] 2>/dev/null || continue
-            find "$base" -name "kernelsu.ko" -type f 2>/dev/null | tee -a /tmp/ko_files.txt || true
+          # Search for the built vmlinux or Module.symvers in Bazel output
+          for search_base in "$CONFIG/out" "$CONFIG" /home/runner/work; do
+            if [ -d "$search_base" ]; then
+              found=$(find "$search_base" -name "Module.symvers" -type f 2>/dev/null | head -1)
+              if [ -n "$found" ]; then
+                KBUILD=$(dirname "$found")
+                echo "Found kernel build at: $KBUILD"
+                break
+              fi
+            fi
           done
 
-          # Follow symlinks in Bazel output
-          if [ -d "$CONFIG" ]; then
-            find "$CONFIG" -name "kernelsu.ko" -follow -type f 2>/dev/null | tee -a /tmp/ko_files.txt || true
+          # Also check KLEAF output path
+          if [ -z "$KBUILD" ]; then
+            KLEAF_OUT="$CONFIG/out/target/product/a05m/obj/KLEAF_OBJ"
+            if [ -d "$KLEAF_OUT" ]; then
+              found=$(find "$KLEAF_OUT" -name "Module.symvers" -type f 2>/dev/null | head -1)
+              if [ -n "$found" ]; then
+                KBUILD=$(dirname "$found")
+                echo "Found KLEAF kernel build at: $KBUILD"
+              fi
+            fi
           fi
 
-          # Deduplicate and copy
-          sort -u /tmp/ko_files.txt | while IFS= read -r ko; do
-            [ -n "$ko" ] && [ -f "$ko" ] && cp -v "$ko" "$KO_DIR/"
+          if [ -z "$KBUILD" ]; then
+            echo "WARN: Could not find kernel build output (Module.symvers)"
+            echo "--- Searching for any Module.symvers ---"
+            find /home/runner -name "Module.symvers" -type f 2>/dev/null | head -5 || true
+            echo "--- Searching for .config ---"
+            find /home/runner -name ".config" -path "*/kernel*" -type f 2>/dev/null | head -5 || true
+            echo "Will try building against kernel source directly..."
+            KBUILD="$COMMON"
+          fi
+
+          # Write the simple root module
+          cat > "$MOD_DIR/simpleroot.c" << 'MODEOF'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/init.h>
+          #include <linux/cred.h>
+          #include <linux/sched.h>
+          #include <linux/uidgid.h>
+          #include <linux/security.h>
+          #include <linux/proc_fs.h>
+          #include <linux/seq_file.h>
+          #include <linux/uaccess.h>
+          #include <linux/capability.h>
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("simpleroot");
+          MODULE_DESCRIPTION("Simple root credential escalation module");
+
+          static struct proc_dir_entry *proc_entry;
+
+          static ssize_t root_write(struct file *file, const char __user *buf,
+                                    size_t count, loff_t *ppos)
+          {
+              struct cred *new_cred;
+              char kbuf[16];
+              size_t len = min(count, sizeof(kbuf) - 1);
+
+              if (copy_from_user(kbuf, buf, len))
+                  return -EFAULT;
+              kbuf[len] = '\0';
+
+              if (kbuf[0] == '1') {
+                  new_cred = prepare_creds();
+                  if (!new_cred)
+                      return -ENOMEM;
+
+                  new_cred->uid = GLOBAL_ROOT_UID;
+                  new_cred->gid = GLOBAL_ROOT_GID;
+                  new_cred->euid = GLOBAL_ROOT_UID;
+                  new_cred->egid = GLOBAL_ROOT_GID;
+                  new_cred->suid = GLOBAL_ROOT_UID;
+                  new_cred->sgid = GLOBAL_ROOT_GID;
+                  new_cred->fsuid = GLOBAL_ROOT_UID;
+                  new_cred->fsgid = GLOBAL_ROOT_GID;
+
+                  new_cred->cap_effective = CAP_FULL_SET;
+                  new_cred->cap_permitted = CAP_FULL_SET;
+                  new_cred->cap_inheritable = CAP_FULL_SET;
+                  new_cred->cap_bset = CAP_FULL_SET;
+                  new_cred->cap_ambient = CAP_FULL_SET;
+
+                  commit_creds(new_cred);
+                  pr_info("simpleroot: granted root to pid %d\n", current->pid);
+              }
+
+              return count;
+          }
+
+          static const struct proc_ops root_ops = {
+              .proc_write = root_write,
+          };
+
+          static int __init simpleroot_init(void)
+          {
+              proc_entry = proc_create("simpleroot", 0222, NULL, &root_ops);
+              if (!proc_entry) {
+                  pr_err("simpleroot: failed to create /proc/simpleroot\n");
+                  return -ENOMEM;
+              }
+              pr_info("simpleroot: loaded — write 1 to /proc/simpleroot for root\n");
+              return 0;
+          }
+
+          static void __exit simpleroot_exit(void)
+          {
+              if (proc_entry)
+                  proc_remove(proc_entry);
+              pr_info("simpleroot: unloaded\n");
+          }
+
+          module_init(simpleroot_init);
+          module_exit(simpleroot_exit);
+          MODEOF
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' "$MOD_DIR/simpleroot.c"
+
+          # Write Makefile
+          cat > "$MOD_DIR/Makefile" << 'MKEOF'
+          obj-m += simpleroot.o
+          MKEOF
+          sed -i 's/^          //' "$MOD_DIR/Makefile"
+
+          echo "--- Module source ---"
+          cat "$MOD_DIR/simpleroot.c"
+          echo "--- Makefile ---"
+          cat "$MOD_DIR/Makefile"
+
+          # Find the cross-compiler
+          CROSS=""
+          for cc in "$COMMON/../prebuilts/clang/host/linux-x86/clang-r530567/bin/clang" \
+                    $(find "$CONFIG" -name "clang" -path "*/bin/clang" -type f 2>/dev/null | head -1) \
+                    $(find /home/runner -name "clang" -path "*/prebuilts/clang/*/bin/clang" -type f 2>/dev/null | head -1); do
+            if [ -x "$cc" ]; then
+              CROSS="$cc"
+              echo "Found clang at: $CROSS"
+              break
+            fi
           done
+
+          # Try to build
+          echo "--- Building module ---"
+          if [ -n "$CROSS" ]; then
+            CC_DIR=$(dirname "$CROSS")
+            export PATH="$CC_DIR:$PATH"
+            make -C "$KBUILD" M="$MOD_DIR" \
+              CC=clang \
+              LLVM=1 \
+              ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              modules 2>&1 || true
+          else
+            echo "WARN: No clang found, trying with default compiler"
+            make -C "$KBUILD" M="$MOD_DIR" \
+              ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              modules 2>&1 || true
+          fi
+
+          echo "--- Build result ---"
+          ls -la "$MOD_DIR/"
+
+          # Copy .ko if built
+          if [ -f "$MOD_DIR/simpleroot.ko" ]; then
+            cp -v "$MOD_DIR/simpleroot.ko" "$KO_DIR/"
+            echo "SUCCESS: simpleroot.ko built!"
+          else
+            echo "FAIL: simpleroot.ko not produced"
+            echo "--- Checking for errors ---"
+            ls -la "$MOD_DIR/" 2>/dev/null || true
+          fi
 
           echo "=== Module output ==="
-          ls -la "$KO_DIR/" 2>/dev/null || echo "No kernelsu.ko found"
+          ls -la "$KO_DIR/" 2>/dev/null || echo "No .ko files found"
 
-          if [ ! -f "$KO_DIR/kernelsu.ko" ]; then
-            echo "=== DEBUG: All .ko files (excluding prebuilts) ==="
-            find "${GITHUB_WORKSPACE}" -name "*.ko" -type f -not -path "*/prebuilts/*" 2>/dev/null | head -50 || true
-          fi
-
-      - name: Upload KernelSU Module
+      - name: Upload Root Module
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.FILE_NAME }}-kernelsu-module
+          name: ${{ env.FILE_NAME }}-simpleroot-module
           path: |
             ./ko_output/*.ko
           if-no-files-found: warn
