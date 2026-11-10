@@ -288,86 +288,14 @@ jobs:
       - name: configure LTO
         uses: ./.github/actions/lto
 
-      - name: Build
-        uses: ./.github/actions/build
-        with:
-         build_type: ${{ inputs.build_type }}
-
-      - name: clean up ccache
-        if: inputs.cache == 'true' && inputs.build_type == 'make'
-        run: ccache -c
-        
-      - name: ccache stats
-        if: inputs.cache == 'true' && inputs.build_type == 'make'
-        run: ccache -s -v || ccache -s
-
-#      - name: bazel cache stats
-#        if: inputs.cache == 'true' && inputs.build_type == 'Bazel'
-#        run: bazel analyze-profile profile.json
-          
-      - name: Prepare AnyKernel3
-        uses: ./.github/actions/ak3zip-prep
-
-      - name: Upload AnyKernel3 Artifacts
-        id: upload_ak3
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ env.FILE_NAME }}-AnyKernel3
-          path: |
-            ./AnyKernel3/**
-          compression-level: 9
-
-      - name: Build simple root module
-        if: always()
+      - name: Inject simpleroot in-tree module
         shell: bash
         run: |
-          set +eo pipefail
-          echo "=== Building simple root module against Samsung kernel ==="
-          KO_DIR="${GITHUB_WORKSPACE}/ko_output"
-          mkdir -p "$KO_DIR"
-          MOD_DIR="${GITHUB_WORKSPACE}/simpleroot"
-          mkdir -p "$MOD_DIR"
+          echo "=== Injecting simpleroot as in-tree kernel module ==="
+          SR_DIR="$COMMON/drivers/simpleroot"
+          mkdir -p "$SR_DIR"
 
-          # Find the kernel build output (Bazel puts it in a sandbox)
-          echo "--- Locating kernel build output ---"
-          KBUILD=""
-
-          # Search for the built vmlinux or Module.symvers in Bazel output
-          for search_base in "$CONFIG/out" "$CONFIG" /home/runner/work; do
-            if [ -d "$search_base" ]; then
-              found=$(find "$search_base" -name "Module.symvers" -type f 2>/dev/null | head -1)
-              if [ -n "$found" ]; then
-                KBUILD=$(dirname "$found")
-                echo "Found kernel build at: $KBUILD"
-                break
-              fi
-            fi
-          done
-
-          # Also check KLEAF output path
-          if [ -z "$KBUILD" ]; then
-            KLEAF_OUT="$CONFIG/out/target/product/a05m/obj/KLEAF_OBJ"
-            if [ -d "$KLEAF_OUT" ]; then
-              found=$(find "$KLEAF_OUT" -name "Module.symvers" -type f 2>/dev/null | head -1)
-              if [ -n "$found" ]; then
-                KBUILD=$(dirname "$found")
-                echo "Found KLEAF kernel build at: $KBUILD"
-              fi
-            fi
-          fi
-
-          if [ -z "$KBUILD" ]; then
-            echo "WARN: Could not find kernel build output (Module.symvers)"
-            echo "--- Searching for any Module.symvers ---"
-            find /home/runner -name "Module.symvers" -type f 2>/dev/null | head -5 || true
-            echo "--- Searching for .config ---"
-            find /home/runner -name ".config" -path "*/kernel*" -type f 2>/dev/null | head -5 || true
-            echo "Will try building against kernel source directly..."
-            KBUILD="$COMMON"
-          fi
-
-          # Write the simple root module
-          cat > "$MOD_DIR/simpleroot.c" << 'MODEOF'
+          cat > "$SR_DIR/simpleroot.c" << 'SRCEOF'
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/init.h>
@@ -435,7 +363,7 @@ jobs:
                   pr_err("simpleroot: failed to create /proc/simpleroot\n");
                   return -ENOMEM;
               }
-              pr_info("simpleroot: loaded — write 1 to /proc/simpleroot for root\n");
+              pr_info("simpleroot: loaded\n");
               return 0;
           }
 
@@ -448,68 +376,115 @@ jobs:
 
           module_init(simpleroot_init);
           module_exit(simpleroot_exit);
-          MODEOF
+          SRCEOF
+          sed -i 's/^          //' "$SR_DIR/simpleroot.c"
 
-          # Remove leading whitespace from heredoc
-          sed -i 's/^          //' "$MOD_DIR/simpleroot.c"
+          echo 'obj-$(CONFIG_SIMPLEROOT) += simpleroot.o' > "$SR_DIR/Makefile"
 
-          # Write Makefile
-          cat > "$MOD_DIR/Makefile" << 'MKEOF'
-          obj-m += simpleroot.o
-          MKEOF
-          sed -i 's/^          //' "$MOD_DIR/Makefile"
+          cat > "$SR_DIR/Kconfig" << 'KCEOF'
+          config SIMPLEROOT
+              tristate "Simple root module"
+              default m
+              help
+                Simple root credential module.
+          KCEOF
+          sed -i 's/^          //' "$SR_DIR/Kconfig"
 
-          echo "--- Module source ---"
-          cat "$MOD_DIR/simpleroot.c"
-          echo "--- Makefile ---"
-          cat "$MOD_DIR/Makefile"
+          # Wire into drivers/Kconfig
+          if ! grep -q "simpleroot" "$COMMON/drivers/Kconfig"; then
+            sed -i '/^endmenu/i source "drivers/simpleroot/Kconfig"' "$COMMON/drivers/Kconfig"
+          fi
 
-          # Find the cross-compiler
-          CROSS=""
-          for cc in "$COMMON/../prebuilts/clang/host/linux-x86/clang-r530567/bin/clang" \
-                    $(find "$CONFIG" -name "clang" -path "*/bin/clang" -type f 2>/dev/null | head -1) \
-                    $(find /home/runner -name "clang" -path "*/prebuilts/clang/*/bin/clang" -type f 2>/dev/null | head -1); do
-            if [ -x "$cc" ]; then
-              CROSS="$cc"
-              echo "Found clang at: $CROSS"
-              break
+          # Wire into drivers/Makefile
+          if ! grep -q "simpleroot" "$COMMON/drivers/Makefile"; then
+            printf 'obj-$(CONFIG_SIMPLEROOT)\t+= simpleroot/\n' >> "$COMMON/drivers/Makefile"
+          fi
+
+          # Enable CONFIG_SIMPLEROOT=m in defconfig
+          if [ -n "$GKI_DEFCONFIG" ] && [ -f "$GKI_DEFCONFIG" ]; then
+            "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --module CONFIG_SIMPLEROOT
+            echo "CONFIG_SIMPLEROOT=m set in $GKI_DEFCONFIG"
+          else
+            echo "WARN: GKI_DEFCONFIG not set, searching for defconfigs..."
+            for dc in $(find "$COMMON/arch/arm64/configs" -name "*defconfig" 2>/dev/null | head -5); do
+              "$COMMON/scripts/config" --file "$dc" --module CONFIG_SIMPLEROOT
+              echo "Set in: $dc"
+            done
+          fi
+
+          echo "=== Injection complete ==="
+          cat "$SR_DIR/simpleroot.c" | head -5
+          echo "Kconfig refs: $(grep -c simpleroot "$COMMON/drivers/Kconfig" 2>/dev/null || echo 0)"
+          echo "Makefile refs: $(grep -c simpleroot "$COMMON/drivers/Makefile" 2>/dev/null || echo 0)"
+
+      - name: Build
+        uses: ./.github/actions/build
+        with:
+         build_type: ${{ inputs.build_type }}
+
+      - name: clean up ccache
+        if: inputs.cache == 'true' && inputs.build_type == 'make'
+        run: ccache -c
+        
+      - name: ccache stats
+        if: inputs.cache == 'true' && inputs.build_type == 'make'
+        run: ccache -s -v || ccache -s
+
+#      - name: bazel cache stats
+#        if: inputs.cache == 'true' && inputs.build_type == 'Bazel'
+#        run: bazel analyze-profile profile.json
+          
+      - name: Prepare AnyKernel3
+        uses: ./.github/actions/ak3zip-prep
+
+      - name: Upload AnyKernel3 Artifacts
+        id: upload_ak3
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.FILE_NAME }}-AnyKernel3
+          path: |
+            ./AnyKernel3/**
+          compression-level: 9
+
+      - name: Collect simpleroot module
+        if: always()
+        shell: bash
+        run: |
+          set +eo pipefail
+          echo "=== Searching for built simpleroot.ko ==="
+          KO_DIR="${GITHUB_WORKSPACE}/ko_output"
+          mkdir -p "$KO_DIR"
+
+          # Search everywhere for simpleroot.ko
+          echo "--- Searching build output ---"
+          found=""
+          for search_dir in "$CONFIG" /home/runner/work /tmp; do
+            if [ -d "$search_dir" ]; then
+              hit=$(find "$search_dir" -name "simpleroot.ko" -type f 2>/dev/null | head -1)
+              if [ -n "$hit" ]; then
+                found="$hit"
+                break
+              fi
             fi
           done
 
-          # Try to build
-          echo "--- Building module ---"
-          if [ -n "$CROSS" ]; then
-            CC_DIR=$(dirname "$CROSS")
-            export PATH="$CC_DIR:$PATH"
-            make -C "$KBUILD" M="$MOD_DIR" \
-              CC=clang \
-              LLVM=1 \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              modules 2>&1 || true
+          if [ -n "$found" ]; then
+            cp -v "$found" "$KO_DIR/"
+            echo "SUCCESS: simpleroot.ko found at $found"
+            ls -la "$KO_DIR/simpleroot.ko"
+            file "$KO_DIR/simpleroot.ko" 2>/dev/null || true
           else
-            echo "WARN: No clang found, trying with default compiler"
-            make -C "$KBUILD" M="$MOD_DIR" \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              modules 2>&1 || true
+            echo "FAIL: simpleroot.ko not found in any build output"
+            echo "--- All .ko files found ---"
+            find "$CONFIG" -name "*.ko" -type f 2>/dev/null | head -30 || true
+            echo "--- Checking .config for SIMPLEROOT ---"
+            find "$CONFIG" -name ".config" -type f 2>/dev/null | while read cfg; do
+              echo "Config: $cfg"
+              grep -i "SIMPLEROOT\|CONFIG_MODULES" "$cfg" 2>/dev/null | head -5 || true
+            done
+            echo "--- Checking if source was injected ---"
+            ls -la "$COMMON/drivers/simpleroot/" 2>/dev/null || echo "Source dir not found"
           fi
-
-          echo "--- Build result ---"
-          ls -la "$MOD_DIR/"
-
-          # Copy .ko if built
-          if [ -f "$MOD_DIR/simpleroot.ko" ]; then
-            cp -v "$MOD_DIR/simpleroot.ko" "$KO_DIR/"
-            echo "SUCCESS: simpleroot.ko built!"
-          else
-            echo "FAIL: simpleroot.ko not produced"
-            echo "--- Checking for errors ---"
-            ls -la "$MOD_DIR/" 2>/dev/null || true
-          fi
-
-          echo "=== Module output ==="
-          ls -la "$KO_DIR/" 2>/dev/null || echo "No .ko files found"
 
       - name: Upload Root Module
         if: always()
