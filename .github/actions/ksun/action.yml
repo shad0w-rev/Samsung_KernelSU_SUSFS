@@ -26,14 +26,13 @@ runs:
     - name: enable in defconfig
       shell: bash
       run: |
-         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --enable CONFIG_KSU
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --module CONFIG_KSU
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --enable CONFIG_MODULES
 
-         if [[ ${{ inputs.susfs }} == 'true' ]]; then
-          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_KDP
-          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_RKP
-          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_DEFEX
-          "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
-         fi
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_KDP
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_RKP
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_DEFEX
+         "$COMMON/scripts/config" --file "$GKI_DEFCONFIG" --disable CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
       
     - name: Extract KSU Version Info and inject into Kbuild
       shell: bash

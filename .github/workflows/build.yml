@@ -316,6 +316,46 @@ jobs:
           path: |
             ./AnyKernel3/**
           compression-level: 9
+
+      - name: Find and upload KernelSU module
+        shell: bash
+        run: |
+          echo "=== Searching for kernelsu .ko files ==="
+          find "$CONFIG" -name "*.ko" 2>/dev/null | grep -i "ksu\|kernelsu" | tee /tmp/ko_files.txt || true
+          echo "=== Searching all .ko files ==="
+          find "$CONFIG" -name "*.ko" 2>/dev/null | head -50 || true
+
+          KO_DIR="${GITHUB_WORKSPACE}/ko_output"
+          mkdir -p "$KO_DIR"
+
+          while IFS= read -r ko; do
+            if [ -n "$ko" ] && [ -f "$ko" ]; then
+              cp "$ko" "$KO_DIR/"
+              echo "Found KSU module: $ko"
+            fi
+          done < /tmp/ko_files.txt
+
+          # Also grab any .ko from common KernelSU build paths
+          for ko in $(find "$CONFIG" -path "*/KernelSU*/*.ko" -o -path "*/kernelsu*.ko" 2>/dev/null); do
+            if [ -f "$ko" ]; then
+              cp "$ko" "$KO_DIR/"
+              echo "Found: $ko"
+            fi
+          done
+
+          # List what we found
+          echo "=== Module output ==="
+          ls -la "$KO_DIR/" 2>/dev/null || echo "No .ko files found"
+
+      - name: Upload KernelSU Module
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.FILE_NAME }}-kernelsu-module
+          path: |
+            ./ko_output/*.ko
+          if-no-files-found: warn
+          compression-level: 0
       
       - name: Scan and collect patch rejects
         if: ${{ always() }}
